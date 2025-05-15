@@ -49,7 +49,7 @@ def get_vals(nested, key):
 # total arguments
 n = len(sys.argv)
 
-# check if we have all the arguments we have the player and the name of the file
+# check if we have all the arguments we need the player and the name of the outpout file
 if n < 3:
 	print('\n usage: python scrapedge.py playerID ouputfile.csv')
 else:
