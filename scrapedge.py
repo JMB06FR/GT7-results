@@ -101,13 +101,14 @@ if __name__ == "__main__":
 				# Get the response
 				data = response.json()
 		
-				# let's see how many pages that player has
+				# let's see how many pages of results that player has
 				lastPage = get_vals(data, 'lastPage')
 				lastPage = lastPage [0]
 			
 				# let's show some progress to the user
 				progressbar(p,lastPage,30,'■')
-		
+
+				# Extract the data 
 				week = get_vals(data, 'week')
 				year = get_vals(data, 'year')
 				eventDate = get_vals(data, 'timestamp') 
@@ -127,8 +128,10 @@ if __name__ == "__main__":
 				deltaLocal = get_vals(data, 'deltaLocal')
 				deltaLocalPerc = get_vals(data, 'deltaLocalPerc')
 
+				# Write the data into the output file
 				for i in range(len(week)):
 					myLine = '\n'+ str(eventDate[i]) +'|'+ str(week[i])+'|'+str(year[i])+'|'+str(eventType[i])+'|'+str(dailyType[i])+'|'+str(carType[i])+'|'+str(tyres[i])+'|'+str(fullName[i])+'|'+str(carName[i])+'|'+str(globalPosition[i])+'|'+str(countryPosition[i])+'|'+str(lapTime[i])+'s|'+str(deltaGlobal[i])+'s|'+ str(deltaGlobalPerc[i])+'%|'+str(deltaLocal[i])+'s|'+str(deltaLocalPerc[i])+'%|'+ player 
 					result_file.write(myLine)
+			# The End.
 			print('\nEnjoy your data!\n')
 		
