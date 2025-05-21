@@ -102,10 +102,14 @@ if __name__ == "__main__":
 				data = response.json()
 		
 				# let's see how many pages of results that player has
-				# Need to add a test if the player exists or not
+				# and test if the player exists or not
 				lastPage = get_vals(data, 'lastPage')
-				lastPage = lastPage [0]
-			
+				if len(lastPage):
+					lastPage = lastPage [0]
+				else:
+					print('Oops! That player doesn\'t look like it exists. Try again ....')
+					exit()
+				
 				# let's show some progress to the user
 				progressbar(p,lastPage,30,'■')
 
