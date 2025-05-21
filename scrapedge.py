@@ -12,7 +12,7 @@
 # Just format those 2 columns to percentage with 2 decimals and that will fix it
 #
 # 20/05/2025 JMB Added the progress bar 
-#
+# 21/05/2025 JMB Added the test if player exists or not 
 #
 
 #!/usr/bin/python3
