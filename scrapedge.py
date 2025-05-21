@@ -102,6 +102,7 @@ if __name__ == "__main__":
 				data = response.json()
 		
 				# let's see how many pages of results that player has
+				# Need to add a test if the player exists or not
 				lastPage = get_vals(data, 'lastPage')
 				lastPage = lastPage [0]
 			
