@@ -13,7 +13,7 @@
 #
 # 20/05/2025 JMB Added the progress bar 
 # 21/05/2025 JMB Added the test if player exists or not 
-#
+# 22/05/2025 JMB Added close of the file and a nicer error messages
 
 #!/usr/bin/python3
 import requests
@@ -66,77 +66,80 @@ def progressbar(current_value,total_value,bar_lengh,progress_char):
 # Main part of the script 
 #
 if __name__ == "__main__":
-	# total arguments
-	n = len(sys.argv)
 
 	# check if we have all the arguments we have the player and the name of the file
-	if n < 3:
-		print('\n usage: python scrapedge.py playerID ouputfile.csv')
-	else:
-		# Arguments passed
-		# should be the pseudo used in GT7 and not the PSN ID
-		player = sys.argv[1]
-		outputFile = sys.argv[2]
-	
-		# if the output file doesn't exist it will be created with the header line titles
-		if not os.path.isfile(outputFile):  
-			with open(outputFile, "a", encoding='utf-8') as result_file: 
-				result_file.write('Date'+'|'+'Week'+'|'+'Year'+'|'+'Event'+'|'+'Type'+'|'+'Group'+'|'+'Tyres'+'|'+'Track'+'|'+'Car'+'|'+'GPosition'+'|'+'CPosition'+'|'+'lapTime'+'|'+'DeltaG'+'|'+ 'DeltaGPerc'+'|'+'DeltaL'+'|'+'DeltaLocalP'+'|Player')   
+	if len(sys.argv) < 3:
+		print('Oops! we are missing parameters: python scrapedge.py playerID ouputfile.csv')
+		exit()
 
-		# if the file already exist the lines will be concatanated one after each other
-		# one line per event  
+	# Arguments passed
+	# should be the pseudo used in GT7 and not the PSN ID
+	player = sys.argv[1]
+	outputFile = sys.argv[2]
+
+	# if the output file doesn't exist it will be created with the header line titles
+	if not os.path.isfile(outputFile):  
 		with open(outputFile, "a", encoding='utf-8') as result_file: 
+			result_file.write('Date'+'|'+'Week'+'|'+'Year'+'|'+'Event'+'|'+'Type'+'|'+'Group'+'|'+'Tyres'+'|'+'Track'+'|'+'Car'+'|'+'GPosition'+'|'+'CPosition'+'|'+'lapTime'+'|'+'DeltaG'+'|'+ 'DeltaGPerc'+'|'+'DeltaL'+'|'+'DeltaLocalP'+'|Player')   
+
+	# if the file already exist the lines will be concatanated one after each other
+	# one line per event  
+	with open(outputFile, "a", encoding='utf-8') as result_file: 
 	
-			params['onlineId'] = player
-			params['ajax_referer'] = "/players/" + player
-			lastPage = params['page']
-			p = 0
-			while p < (int(lastPage)):
-				p=p+1
-				params["page"] = p
+		# Let's prepare the paramaters for the API call
+		params['onlineId'] = player
+		params['ajax_referer'] = "/players/" + player
+		lastPage = params['page']
+		p = 0
+		while p < (int(lastPage)):
+			p=p+1
+			params["page"] = p
 		
-				# A POST request to the API
-				response = requests.post(url, json=params)
+			# A POST request to the API
+			response = requests.post(url, json=params)
 		
-				# Get the response
-				data = response.json()
+			# Get the response
+			data = response.json()
 		
-				# let's see how many pages of results that player has
-				# and test if the player exists or not
-				lastPage = get_vals(data, 'lastPage')
-				if len(lastPage):
-					lastPage = lastPage [0]
-				else:
-					print('Oops! That player doesn\'t look like it exists. Try again ....')
-					exit()
+			# let's see how many pages of results that player has
+			# and test if the player exists or not
+			lastPage = get_vals(data, 'lastPage')
+			if len(lastPage):
+				lastPage = lastPage [0]
+			else:
+				print('Oops! That player doesn\'t look like it exists. Try again ....')
+				exit()
 				
-				# let's show some progress to the user
-				progressbar(p,lastPage,30,'■')
+			# let's show some progress to the user
+			progressbar(p,lastPage,30,'■')
+		
+			# Extract the data 
+			week = get_vals(data, 'week')
+			year = get_vals(data, 'year')
+			eventDate = get_vals(data, 'timestamp') 
+			eventType = get_vals(data, 'eventType')	
+			dailyType = get_vals(data, 'dailyType')
+			carType = get_vals(data, 'carType')
+			tyres = get_vals(data, 'tyres')
+			track = get_vals(data, 'track')
+			fullName = get_vals(track, 'fullName')
+			car = get_vals(data, 'playerResult')
+			carName = get_vals(car,'name')
+			globalPosition = get_vals(data, 'globalPosition')
+			countryPosition = get_vals(data, 'countryPosition')
+			lapTime = get_vals(data, 'time')
+			deltaGlobal = get_vals(data, 'deltaGlobal')
+			deltaGlobalPerc = get_vals(data, 'deltaGlobalPerc')
+			deltaLocal = get_vals(data, 'deltaLocal')
+			deltaLocalPerc = get_vals(data, 'deltaLocalPerc')
 
-				# Extract the data 
-				week = get_vals(data, 'week')
-				year = get_vals(data, 'year')
-				eventDate = get_vals(data, 'timestamp') 
-				eventType = get_vals(data, 'eventType')	
-				dailyType = get_vals(data, 'dailyType')
-				carType = get_vals(data, 'carType')
-				tyres = get_vals(data, 'tyres')
-				track = get_vals(data, 'track')
-				fullName = get_vals(track, 'fullName')
-				car = get_vals(data, 'playerResult')
-				carName = get_vals(car,'name')
-				globalPosition = get_vals(data, 'globalPosition')
-				countryPosition = get_vals(data, 'countryPosition')
-				lapTime = get_vals(data, 'time')
-				deltaGlobal = get_vals(data, 'deltaGlobal')
-				deltaGlobalPerc = get_vals(data, 'deltaGlobalPerc')
-				deltaLocal = get_vals(data, 'deltaLocal')
-				deltaLocalPerc = get_vals(data, 'deltaLocalPerc')
+			# Write the data into the output file
+			for i in range(len(week)):
+				myLine = '\n'+ str(eventDate[i]) +'|'+ str(week[i])+'|'+str(year[i])+'|'+str(eventType[i])+'|'+str(dailyType[i])+'|'+str(carType[i])+'|'+str(tyres[i])+'|'+str(fullName[i])+'|'+str(carName[i])+'|'+str(globalPosition[i])+'|'+str(countryPosition[i])+'|'+str(lapTime[i])+'s|'+str(deltaGlobal[i])+'s|'+ str(deltaGlobalPerc[i])+'%|'+str(deltaLocal[i])+'s|'+str(deltaLocalPerc[i])+'%|'+ player 
+				result_file.write(myLine)
 
-				# Write the data into the output file
-				for i in range(len(week)):
-					myLine = '\n'+ str(eventDate[i]) +'|'+ str(week[i])+'|'+str(year[i])+'|'+str(eventType[i])+'|'+str(dailyType[i])+'|'+str(carType[i])+'|'+str(tyres[i])+'|'+str(fullName[i])+'|'+str(carName[i])+'|'+str(globalPosition[i])+'|'+str(countryPosition[i])+'|'+str(lapTime[i])+'s|'+str(deltaGlobal[i])+'s|'+ str(deltaGlobalPerc[i])+'%|'+str(deltaLocal[i])+'s|'+str(deltaLocalPerc[i])+'%|'+ player 
-					result_file.write(myLine)
-			# The End.
-			print('\nEnjoy your data!\n')
+		# The End.
+		result_file.close()
+		print('\nEnjoy your data!\n')
+		exit()
 		
