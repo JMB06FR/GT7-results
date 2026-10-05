@@ -1,151 +1,1156 @@
-# 2025-05-15
-# Python 3.11.9
-# Small scraper for the https:/www.dg-edge.com/players/PLAYERID pages allowing to get all the results of the events for a player
-# Will create a csv file which can be imported in excel and then you can see your progress
-# Dislaimer: Provided as it is :)
-# Feel free to make it better !!!
-#
-# Author: Jean-Michel Becar jm@becar.com  JMB06FR
-#
-#
-# Note: Sometimes when importing the csv file in Excel the columns DeltaGPerc and DeltaLocalP are not well formatted to percentage 
-# Just format those 2 columns to percentage with 2 decimals and that will fix it
-#
-# 20/05/2025 JMB Added the progress bar 
-# 21/05/2025 JMB Added the test if player exists or not 
-# 22/05/2025 JMB Added close of the file and a nicer error messages
+#!/usr/bin/env python3
 
-#!/usr/bin/python3
-import requests
-import sys
+"""
+GT7 DG-EDGE Player Results Scraper
+==================================
+
+Retrieves all GT7 event results for a player from DG-EDGE.
+
+The script automatically:
+    - Opens the DG-EDGE player page using Chromium
+    - Captures DG-EDGE's own API request
+    - Obtains the current API version
+    - Obtains the current ss_id
+    - Obtains the CSRF token
+    - Transfers browser cookies into a requests session
+    - Retrieves all pages of player results
+    - Refreshes the CSRF token after every API request
+    - Exports the results to an Excel-friendly pipe-delimited CSV
+
+Installation:
+    pip install requests playwright
+    python -m playwright install chromium
+
+Usage:
+    python scrapedge.py PLAYERID output.csv
+
+Example:
+    python scrapedge.py JMB06FR results.csv
+
+To overwrite an existing CSV:
+    python scrapedge.py JMB06FR results.csv --overwrite
+
+To show Chromium while starting the session:
+    python scrapedge.py JMB06FR results.csv --headed
+"""
+
+import argparse
+import csv
 import os
-import json
-from urllib.request import Request, urlopen
-from pprint import pprint
-from pyquery import PyQuery
+import sys
+from urllib.parse import quote
 
-# The API endpoint
-url = "https://admin.dg-edge.com/api/b.players.retrievePlayerEvents"
+import requests
+from playwright.sync_api import (
+    sync_playwright,
+    TimeoutError as PlaywrightTimeoutError
+)
 
-# Data to be sent
-params = {
-    "onlineId": "",
-    "page": 1,
-    "language": "EN",
-    "version": 90,
-    "cookieVersion": "",
-    "ajax_referer": "",
-    "ss_id": "lmbjgjrmvk6o4cjifpdnp059jh"
-}
 
-#
-# Extract the values from a list recursively
-#
-def get_vals(nested, key):
-    result = []
-    if isinstance(nested, list) and nested != []:   #non-empty list
-        for lis in nested:
-            result.extend(get_vals(lis, key))
-    elif isinstance(nested, dict) and nested != {}:   #non-empty dict
-        for val in nested.values():
-            if isinstance(val, (list, dict)):   #(list or dict) in dict
-                result.extend(get_vals(val, key))
-        if key in nested.keys():   #key found in dict
-            result.append(nested[key])
-    return result
+# ==============================================================
+# Configuration
+# ==============================================================
 
-#
-# Simple progress bar
-#
-def progressbar(current_value,total_value,bar_lengh,progress_char): 
-    percentage = int((current_value/total_value)*100)                                                # Percent Completed Calculation 
-    progress = int((bar_lengh * current_value ) / total_value)                                       # Progress Done Calculation 
-    loadbar = "Progress: [{:{len}}]{}%".format(progress*progress_char,percentage,len = bar_lengh)    # Progress Bar String
-    print(loadbar, end='\r')      
+DG_EDGE_URL = "https://www.dg-edge.com"
 
-#
-# Main part of the script 
-#
+API_URL = (
+    "https://admin.dg-edge.com/"
+    "api/b.players.retrievePlayerEvents"
+)
+
+API_NAME = "b.players.retrievePlayerEvents"
+
+BROWSER_TIMEOUT = 45000       # milliseconds
+REQUEST_TIMEOUT = 30          # seconds
+
+
+# ==============================================================
+# Utility functions
+# ==============================================================
+
+def safe(value):
+    """
+    Return an empty string when the API value is null.
+    """
+    return "" if value is None else value
+
+
+def add_suffix(value, suffix):
+    """
+    Add a suffix to a value unless the value is None or empty.
+
+    Examples:
+        +01.858 -> +01.858s
+        2.05    -> 2.05%
+    """
+
+    if value is None or value == "":
+        return ""
+
+    return f"{value}{suffix}"
+
+
+def progressbar(current, total, records_written):
+    """
+    Display a simple progress bar.
+    """
+
+    if total <= 0:
+        return
+
+    length = 30
+
+    percentage = int((current / total) * 100)
+    completed = int(length * current / total)
+
+    bar = "■" * completed
+    spaces = " " * (length - completed)
+
+    print(
+        f"Progress: [{bar}{spaces}] "
+        f"{percentage:3d}% "
+        f"Page {current}/{total} "
+        f"- {records_written} records",
+        end="\r",
+        flush=True
+    )
+
+
+# ==============================================================
+# DG-EDGE browser bootstrap
+# ==============================================================
+
+def initialise_dgedge_session(player, headed=False):
+    """
+    Open the player's DG-EDGE page in Chromium and wait for
+    DG-EDGE itself to call retrievePlayerEvents.
+
+    Instead of trying to guess session parameters, we simply
+    capture the legitimate API request produced by DG-EDGE.
+
+    Returns:
+        {
+            "params":      API JSON parameters,
+            "headers":     browser request headers,
+            "cookies":     browser cookies,
+            "first_data":  JSON response for page 1,
+            "csrf_token":  token to use for the next request
+        }
+    """
+
+    player_url = (
+        f"{DG_EDGE_URL}/players/"
+        f"{quote(player, safe='')}"
+    )
+
+    print("Initialising DG-EDGE session...")
+    print(f"Opening: {player_url}")
+
+    try:
+
+        with sync_playwright() as playwright:
+
+            browser = playwright.chromium.launch(
+                headless=not headed
+            )
+
+            try:
+
+                context = browser.new_context()
+
+                page = context.new_page()
+
+                # --------------------------------------------------
+                # Wait for the API request generated by DG-EDGE
+                # --------------------------------------------------
+
+                with page.expect_response(
+                    lambda response:
+                        API_NAME in response.url
+                        and response.request.method == "POST",
+                    timeout=BROWSER_TIMEOUT
+                ) as response_info:
+
+                    page.goto(
+                        player_url,
+                        wait_until="domcontentloaded",
+                        timeout=BROWSER_TIMEOUT
+                    )
+
+                api_response = response_info.value
+                api_request = api_response.request
+
+                # --------------------------------------------------
+                # Verify API HTTP response
+                # --------------------------------------------------
+
+                if api_response.status != 200:
+
+                    raise RuntimeError(
+                        "DG-EDGE API returned HTTP "
+                        f"{api_response.status}"
+                    )
+
+                # --------------------------------------------------
+                # Parameters used by DG-EDGE itself
+                # --------------------------------------------------
+
+                api_params = api_request.post_data_json
+
+                if not isinstance(api_params, dict):
+
+                    raise RuntimeError(
+                        "Could not capture DG-EDGE "
+                        "API parameters."
+                    )
+
+                # --------------------------------------------------
+                # Browser request headers
+                # --------------------------------------------------
+
+                request_headers = (
+                    api_request.all_headers()
+                )
+
+                # --------------------------------------------------
+                # Page 1 API response
+                # --------------------------------------------------
+
+                first_data = api_response.json()
+
+                if not isinstance(first_data, dict):
+
+                    raise RuntimeError(
+                        "DG-EDGE returned an unexpected "
+                        "JSON response."
+                    )
+
+                # --------------------------------------------------
+                # Get newest CSRF token
+                #
+                # DG-EDGE sends a new CSRF token in the response.
+                # If for some reason it isn't there, use the one
+                # from the browser request.
+                # --------------------------------------------------
+
+                csrf_token = first_data.get(
+                    "csrfToken"
+                )
+
+                if not csrf_token:
+
+                    csrf_token = (
+                        request_headers.get(
+                            "x-csrf-token"
+                        )
+                    )
+
+                if not csrf_token:
+
+                    raise RuntimeError(
+                        "Could not obtain the "
+                        "DG-EDGE CSRF token."
+                    )
+
+                # --------------------------------------------------
+                # Copy browser cookies
+                # --------------------------------------------------
+
+                cookies = context.cookies()
+
+                # --------------------------------------------------
+                # Validate important captured parameters
+                # --------------------------------------------------
+
+                print(
+                   "Captured API parameters:",
+                   ", ".join(api_params.keys())
+                )
+
+                if "version" in api_params:
+                    print("API version detected:",api_params["version"])
+
+                print(
+                    "DG-EDGE session successfully "
+                    "initialised."
+                )
+
+                print(
+                    "API version detected:",
+                    api_params.get("version")
+                )
+
+                return {
+                    "params": api_params,
+                    "headers": request_headers,
+                    "cookies": cookies,
+                    "first_data": first_data,
+                    "csrf_token": csrf_token
+                }
+
+            finally:
+
+                browser.close()
+
+    except PlaywrightTimeoutError as error:
+
+        raise RuntimeError(
+            "Timed out waiting for DG-EDGE to call "
+            "retrievePlayerEvents.\n"
+            "Check that the player exists, or try "
+            "running with --headed."
+        ) from error
+
+
+# ==============================================================
+# Build Requests session
+# ==============================================================
+
+def create_requests_session(
+    browser_headers,
+    browser_cookies,
+    csrf_token
+):
+    """
+    Create a requests.Session using the browser session
+    information captured by Playwright.
+    """
+
+    session = requests.Session()
+
+    # ----------------------------------------------------------
+    # Use useful headers captured from Chromium.
+    #
+    # Browser-specific Sec-* headers are deliberately omitted.
+    # requests does not need to pretend to be Chromium at that
+    # level.
+    # ----------------------------------------------------------
+
+    session.headers.update({
+
+        "Accept":
+            browser_headers.get(
+                "accept",
+                "application/json"
+            ),
+
+        "Content-Type":
+            browser_headers.get(
+                "content-type",
+                "application/json"
+            ),
+
+        "Origin":
+            browser_headers.get(
+                "origin",
+                DG_EDGE_URL
+            ),
+
+        "Referer":
+            browser_headers.get(
+                "referer",
+                f"{DG_EDGE_URL}/"
+            ),
+
+        "User-Agent":
+            browser_headers.get(
+                "user-agent",
+                "Mozilla/5.0"
+            ),
+
+        "x-csrf-token":
+            csrf_token
+    })
+
+    # ----------------------------------------------------------
+    # Copy Chromium cookies into Requests
+    # ----------------------------------------------------------
+
+    for cookie in browser_cookies:
+
+        try:
+
+            session.cookies.set(
+                cookie["name"],
+                cookie["value"],
+                domain=cookie.get("domain"),
+                path=cookie.get("path", "/")
+            )
+
+        except Exception:
+
+            # Very unusual cookie attributes should not prevent
+            # the scraper from continuing.
+            session.cookies.set(
+                cookie["name"],
+                cookie["value"]
+            )
+
+    return session
+
+
+# ==============================================================
+# API response validation
+# ==============================================================
+
+def parse_api_response(data):
+    """
+    Validate a DG-EDGE API response and return:
+
+        events
+        pagination
+    """
+
+    if not isinstance(data, dict):
+
+        raise RuntimeError(
+            "DG-EDGE returned an invalid response."
+        )
+
+    if not data.get("success"):
+
+        raise RuntimeError(
+            "DG-EDGE returned success=false."
+        )
+
+    payload = data.get("payload")
+
+    if not isinstance(payload, dict):
+
+        raise RuntimeError(
+            "DG-EDGE response does not contain "
+            "a valid payload."
+        )
+
+    events = payload.get("list", [])
+
+    pagination = payload.get(
+        "pagination",
+        {}
+    )
+
+    if not isinstance(events, list):
+
+        raise RuntimeError(
+            "DG-EDGE payload.list is not an array."
+        )
+
+    return events, pagination
+
+
+# ==============================================================
+# Convert one API event into one CSV row
+# ==============================================================
+
+def convert_event_to_row(event, player):
+    """
+    Convert the DG-EDGE event structure into the same fields
+    used by the original GT7-results scraper.
+    """
+
+    # ----------------------------------------------------------
+    # Nested structures
+    # ----------------------------------------------------------
+
+    track = event.get("track") or {}
+
+    player_result = (
+        event.get("playerResult") or {}
+    )
+
+    result_car = (
+        player_result.get("car") or {}
+    )
+
+    # ----------------------------------------------------------
+    # Build CSV row
+    # ----------------------------------------------------------
+
+    return {
+
+        "Date":
+            safe(
+                player_result.get(
+                    "timestamp"
+                )
+            ),
+
+        "Week":
+            safe(
+                event.get("week")
+            ),
+
+        "Year":
+            safe(
+                event.get("year")
+            ),
+
+        "Event":
+            safe(
+                event.get("eventType")
+            ),
+
+        "Type":
+            safe(
+                event.get("dailyType")
+            ),
+
+        "Group":
+            safe(
+                event.get("carType")
+            ),
+
+        "Tyres":
+            safe(
+                event.get("tyres")
+            ),
+
+        "Track":
+            safe(
+                track.get("fullName")
+            ),
+
+        "Car":
+            safe(
+                result_car.get("name")
+            ),
+
+        "GPosition":
+            safe(
+                player_result.get(
+                    "globalPosition"
+                )
+            ),
+
+        "CPosition":
+            safe(
+                player_result.get(
+                    "countryPosition"
+                )
+            ),
+
+        # Preserve formatting used by the original scraper
+        "lapTime":
+            add_suffix(
+                player_result.get("time"),
+                "s"
+            ),
+
+        "DeltaG":
+            add_suffix(
+                player_result.get(
+                    "deltaGlobal"
+                ),
+                "s"
+            ),
+
+        "DeltaGPerc":
+            add_suffix(
+                player_result.get(
+                    "deltaGlobalPerc"
+                ),
+                "%"
+            ),
+
+        "DeltaL":
+            add_suffix(
+                player_result.get(
+                    "deltaLocal"
+                ),
+                "s"
+            ),
+
+        "DeltaLocalP":
+            add_suffix(
+                player_result.get(
+                    "deltaLocalPerc"
+                ),
+                "%"
+            ),
+
+        "Player":
+            player
+    }
+
+
+# ==============================================================
+# Write one page of events
+# ==============================================================
+
+def write_events(
+    writer,
+    events,
+    player
+):
+    """
+    Write all events from one DG-EDGE page.
+    """
+
+    count = 0
+
+    for event in events:
+
+        row = convert_event_to_row(
+            event,
+            player
+        )
+
+        writer.writerow(row)
+
+        count += 1
+
+    return count
+
+
+# ==============================================================
+# Fetch an API page using Requests
+# ==============================================================
+
+def fetch_page(
+    session,
+    base_params,
+    player,
+    page_number
+):
+    """
+    Retrieve one page of player results using exactly the
+    parameters captured from the DG-EDGE website.
+    """
+
+    params = base_params.copy()
+
+    params["onlineId"] = player
+    params["page"] = page_number
+
+    if "ajax_referer" in params:
+        params["ajax_referer"] = (
+            f"/players/{player}"
+        )
+
+    response = session.post(
+        API_URL,
+        json=params,
+        timeout=REQUEST_TIMEOUT
+    )
+
+    return response
+
+
+# ==============================================================
+# Main
+# ==============================================================
+
+def main():
+
+    # ----------------------------------------------------------
+    # Command line
+    # ----------------------------------------------------------
+
+    parser = argparse.ArgumentParser(
+
+        description=(
+            "Download all GT7 player event results "
+            "from DG-EDGE."
+        )
+    )
+
+    parser.add_argument(
+        "player",
+        help=(
+            "GT7 player Online ID / nickname"
+        )
+    )
+
+    parser.add_argument(
+        "output",
+        help=(
+            "CSV output file"
+        )
+    )
+
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Overwrite the output file instead "
+            "of appending to it"
+        )
+    )
+
+    parser.add_argument(
+        "--headed",
+        action="store_true",
+        help=(
+            "Show Chromium while initialising "
+            "the DG-EDGE session"
+        )
+    )
+
+    args = parser.parse_args()
+
+    player = args.player
+    output_file = args.output
+
+    print()
+    print("=" * 60)
+    print("GT7 DG-EDGE Results Scraper")
+    print("=" * 60)
+    print()
+    print(f"Player : {player}")
+    print(f"Output : {output_file}")
+    print()
+
+    # ----------------------------------------------------------
+    # Bootstrap DG-EDGE session
+    # ----------------------------------------------------------
+
+    try:
+
+        bootstrap = (
+            initialise_dgedge_session(
+                player,
+                headed=args.headed
+            )
+        )
+
+    except Exception as error:
+
+        print()
+        print("ERROR:")
+        print(error)
+        print()
+        sys.exit(1)
+
+    base_params = bootstrap["params"]
+
+    # ----------------------------------------------------------
+    # The initial browser request already retrieved page 1.
+    #
+    # We use that response instead of requesting page 1 again.
+    # ----------------------------------------------------------
+
+    first_data = bootstrap["first_data"]
+
+    try:
+
+        first_events, pagination = (
+            parse_api_response(
+                first_data
+            )
+        )
+
+    except RuntimeError as error:
+
+        print()
+        print("ERROR:")
+        print(error)
+        print()
+        sys.exit(1)
+
+    # ----------------------------------------------------------
+    # Player existence / no results
+    # ----------------------------------------------------------
+
+    if not first_events:
+
+        print()
+        print(
+            f"No results were found for '{player}'."
+        )
+
+        print(
+            "Check that you are using the player's "
+            "GT7 Online ID."
+        )
+
+        print()
+
+        sys.exit(0)
+
+    # ----------------------------------------------------------
+    # Pagination
+    # ----------------------------------------------------------
+
+    try:
+
+        last_page = int(
+            pagination.get(
+                "lastPage",
+                1
+            )
+        )
+
+    except (TypeError, ValueError):
+
+        last_page = 1
+
+    total_records = pagination.get(
+        "totalRecords"
+    )
+
+    print()
+    print(
+        f"Pages detected   : {last_page}"
+    )
+
+    if total_records is not None:
+
+        print(
+            f"Results detected : {total_records}"
+        )
+
+    print()
+
+    # ----------------------------------------------------------
+    # Create Requests session
+    # ----------------------------------------------------------
+
+    session = create_requests_session(
+
+        bootstrap["headers"],
+
+        bootstrap["cookies"],
+
+        bootstrap["csrf_token"]
+    )
+
+    # ----------------------------------------------------------
+    # CSV columns
+    # ----------------------------------------------------------
+
+    fieldnames = [
+
+        "Date",
+        "Week",
+        "Year",
+        "Event",
+        "Type",
+        "Group",
+        "Tyres",
+        "Track",
+        "Car",
+        "GPosition",
+        "CPosition",
+        "lapTime",
+        "DeltaG",
+        "DeltaGPerc",
+        "DeltaL",
+        "DeltaLocalP",
+        "Player"
+    ]
+
+    # ----------------------------------------------------------
+    # File mode
+    # ----------------------------------------------------------
+
+    if args.overwrite:
+
+        file_mode = "w"
+        write_header = True
+
+    else:
+
+        file_mode = "a"
+
+        write_header = (
+            not os.path.exists(output_file)
+            or os.path.getsize(output_file) == 0
+        )
+
+    records_written = 0
+
+    # ----------------------------------------------------------
+    # Retrieve and export data
+    # ----------------------------------------------------------
+
+    try:
+
+        with open(
+            output_file,
+            file_mode,
+            newline="",
+            encoding="utf-8"
+        ) as result_file:
+
+            writer = csv.DictWriter(
+
+                result_file,
+
+                fieldnames=fieldnames,
+
+                delimiter="|",
+
+                quoting=csv.QUOTE_MINIMAL
+            )
+
+            if write_header:
+
+                writer.writeheader()
+
+            # ==================================================
+            # PAGE 1
+            #
+            # Already retrieved by Chromium.
+            # ==================================================
+
+            records_written += write_events(
+                writer,
+                first_events,
+                player
+            )
+
+            progressbar(
+                1,
+                last_page,
+                records_written
+            )
+
+            # ==================================================
+            # Remaining pages
+            # ==================================================
+
+            page_number = 2
+
+            while page_number <= last_page:
+
+                # ----------------------------------------------
+                # Retrieve page
+                # ----------------------------------------------
+
+                response = fetch_page(
+
+                    session,
+                    base_params,
+                    player,
+                    page_number
+                )
+
+                # ----------------------------------------------
+                # Session expired?
+                #
+                # Re-bootstrap once automatically.
+                # ----------------------------------------------
+
+                if response.status_code == 403:
+
+                    print()
+                    print()
+                    print(
+                        "DG-EDGE session expired."
+                    )
+
+                    print(
+                        "Automatically creating "
+                        "a new session..."
+                    )
+
+                    bootstrap = (
+                        initialise_dgedge_session(
+                            player,
+                            headed=args.headed
+                        )
+                    )
+
+                    base_params = (
+                        bootstrap["params"]
+                    )
+
+                    session.close()
+
+                    session = (
+                        create_requests_session(
+
+                            bootstrap["headers"],
+
+                            bootstrap["cookies"],
+
+                            bootstrap[
+                                "csrf_token"
+                            ]
+                        )
+                    )
+
+                    # Retry current page
+                    response = fetch_page(
+
+                        session,
+                        base_params,
+                        player,
+                        page_number
+                    )
+
+                # ----------------------------------------------
+                # Any HTTP problem
+                # ----------------------------------------------
+
+                response.raise_for_status()
+
+                # ----------------------------------------------
+                # Decode JSON
+                # ----------------------------------------------
+
+                data = response.json()
+
+                # ----------------------------------------------
+                # Validate JSON structure
+                # ----------------------------------------------
+
+                events, page_pagination = (
+                    parse_api_response(
+                        data
+                    )
+                )
+
+                # ----------------------------------------------
+                # DG-EDGE sends a new CSRF token after each
+                # request.
+                # ----------------------------------------------
+
+                new_csrf_token = data.get(
+                    "csrfToken"
+                )
+
+                if new_csrf_token:
+
+                    session.headers[
+                        "x-csrf-token"
+                    ] = new_csrf_token
+
+                # ----------------------------------------------
+                # Write page
+                # ----------------------------------------------
+
+                records_written += (
+                    write_events(
+                        writer,
+                        events,
+                        player
+                    )
+                )
+
+                # ----------------------------------------------
+                # DG-EDGE may theoretically change lastPage
+                # while we're retrieving results.
+                # ----------------------------------------------
+
+                api_last_page = (
+                    page_pagination.get(
+                        "lastPage"
+                    )
+                )
+
+                if api_last_page is not None:
+
+                    try:
+
+                        last_page = int(
+                            api_last_page
+                        )
+
+                    except (
+                        TypeError,
+                        ValueError
+                    ):
+
+                        pass
+
+                # ----------------------------------------------
+                # Progress
+                # ----------------------------------------------
+
+                progressbar(
+                    page_number,
+                    last_page,
+                    records_written
+                )
+
+                page_number += 1
+
+    except requests.exceptions.RequestException as error:
+
+        print()
+        print()
+        print("NETWORK / API ERROR:")
+        print(error)
+        print()
+
+        sys.exit(1)
+
+    except ValueError as error:
+
+        print()
+        print()
+        print("JSON ERROR:")
+        print(
+            "DG-EDGE returned data that "
+            "could not be decoded."
+        )
+        print(error)
+        print()
+
+        sys.exit(1)
+
+    except OSError as error:
+
+        print()
+        print()
+        print("FILE ERROR:")
+        print(error)
+        print()
+
+        sys.exit(1)
+
+    finally:
+
+        session.close()
+
+    # ----------------------------------------------------------
+    # Finished
+    # ----------------------------------------------------------
+
+    print()
+    print()
+
+    print("=" * 60)
+    print("Completed")
+    print("=" * 60)
+
+    print()
+
+    print(
+        f"Player          : {player}"
+    )
+
+    print(
+        f"Records written : {records_written}"
+    )
+
+    print(
+        f"Output file     : {output_file}"
+    )
+
+    if (
+        total_records is not None
+        and records_written
+        != total_records
+    ):
+
+        print()
+
+        print(
+            "NOTE: DG-EDGE reported "
+            f"{total_records} records but "
+            f"{records_written} were written."
+        )
+
+    print()
+    print("Enjoy your data!")
+    print()
+
+
+# ==============================================================
+# Start
+# ==============================================================
+
 if __name__ == "__main__":
-
-	# check if we have all the arguments we have the player and the name of the file
-	if len(sys.argv) < 3:
-		print('Oops! we are missing parameters: python scrapedge.py playerID ouputfile.csv')
-		exit()
-
-	# Arguments passed
-	# should be the pseudo used in GT7 and not the PSN ID
-	player = sys.argv[1]
-	outputFile = sys.argv[2]
-
-	# if the output file doesn't exist it will be created with the header line titles
-	if not os.path.isfile(outputFile):  
-		with open(outputFile, "a", encoding='utf-8') as result_file: 
-			result_file.write('Date'+'|'+'Week'+'|'+'Year'+'|'+'Event'+'|'+'Type'+'|'+'Group'+'|'+'Tyres'+'|'+'Track'+'|'+'Car'+'|'+'GPosition'+'|'+'CPosition'+'|'+'lapTime'+'|'+'DeltaG'+'|'+ 'DeltaGPerc'+'|'+'DeltaL'+'|'+'DeltaLocalP'+'|Player')   
-
-	# if the file already exist the lines will be concatanated one after each other
-	# one line per event  
-	with open(outputFile, "a", encoding='utf-8') as result_file: 
-	
-		# Let's prepare the paramaters for the API call
-		params['onlineId'] = player
-		params['ajax_referer'] = "/players/" + player
-		lastPage = params['page']
-		p = 0
-		while p < (int(lastPage)):
-			p=p+1
-			params["page"] = p
-		
-			# A POST request to the API
-			response = requests.post(url, json=params)
-		
-			# Get the response
-			data = response.json()
-			# Save the raw JSON response from the first page for analysis
-			if p == 1:
-    			with open("response.json", "w", encoding="utf-8") as json_file:
-        			json.dump(data, json_file, indent=4, ensure_ascii=False)
-    				print("\nRaw API response saved to response.json")
-
-			# let's see how many pages of results that player has
-			# and test if the player exists or not
-			lastPage = get_vals(data, 'lastPage')
-			if len(lastPage):
-				lastPage = lastPage [0]
-			else:
-				print('Oops! That player doesn\'t look like it exists. Try again ....')
-				exit()
-				
-			# let's show some progress to the user
-			progressbar(p,lastPage,30,'■')
-		
-			# Extract the data 
-			week = get_vals(data, 'week')
-			year = get_vals(data, 'year')
-			eventDate = get_vals(data, 'timestamp') 
-			eventType = get_vals(data, 'eventType')	
-			dailyType = get_vals(data, 'dailyType')
-			carType = get_vals(data, 'carType')
-			tyres = get_vals(data, 'tyres')
-			track = get_vals(data, 'track')
-			fullName = get_vals(track, 'fullName')
-			car = get_vals(data, 'playerResult')
-			carName = get_vals(car,'name')
-			globalPosition = get_vals(data, 'globalPosition')
-			countryPosition = get_vals(data, 'countryPosition')
-			lapTime = get_vals(data, 'time')
-			deltaGlobal = get_vals(data, 'deltaGlobal')
-			deltaGlobalPerc = get_vals(data, 'deltaGlobalPerc')
-			deltaLocal = get_vals(data, 'deltaLocal')
-			deltaLocalPerc = get_vals(data, 'deltaLocalPerc')
-
-			# Write the data into the output file
-			for i in range(len(week)):
-				myLine = '\n'+ str(eventDate[i]) +'|'+ str(week[i])+'|'+str(year[i])+'|'+str(eventType[i])+'|'+str(dailyType[i])+'|'+str(carType[i])+'|'+str(tyres[i])+'|'+str(fullName[i])+'|'+str(carName[i])+'|'+str(globalPosition[i])+'|'+str(countryPosition[i])+'|'+str(lapTime[i])+'s|'+str(deltaGlobal[i])+'s|'+ str(deltaGlobalPerc[i])+'%|'+str(deltaLocal[i])+'s|'+str(deltaLocalPerc[i])+'%|'+ player 
-				result_file.write(myLine)
-
-		# The End.
-		result_file.close()
-		print('\nEnjoy your data!\n')
-		exit()
-		
+    main()
