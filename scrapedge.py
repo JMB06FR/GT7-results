@@ -19,6 +19,7 @@
 import requests
 import sys
 import os
+import json
 from urllib.request import Request, urlopen
 from pprint import pprint
 from pyquery import PyQuery
@@ -100,7 +101,12 @@ if __name__ == "__main__":
 		
 			# Get the response
 			data = response.json()
-		
+			# Save the raw JSON response from the first page for analysis
+			if p == 1:
+    			with open("response.json", "w", encoding="utf-8") as json_file:
+        			json.dump(data, json_file, indent=4, ensure_ascii=False)
+    				print("\nRaw API response saved to response.json")
+
 			# let's see how many pages of results that player has
 			# and test if the player exists or not
 			lastPage = get_vals(data, 'lastPage')
